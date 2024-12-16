@@ -16,260 +16,184 @@ from ..utils.type_utils import get_accumulator_dtype
 # TODO.boyue add autotune decorator back
 @libentry()
 @triton.jit(do_not_specialize=["epsilon"])
-def kernel_bn_forward(y_ptr, x_ptr, weight_ptr, bias_ptr, epsilon,
-                      lock_ptr, sum_x_ptr, sum_xx_ptr, n_completed_ptr,
-                      stride_n, stride_c, stride_h, stride_w, N, C, H, W,
-                      BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_HW: tl.constexpr):
+def kernel_bn_forward(Y, X_mean, X_stdvar, X_normed, X, weight_ptr, bias_ptr, stride_n, stride_c, stride_s,
+                      epsilon: tl.constexpr,
+                      SHAPE_N: tl.constexpr, SHAPE_C: tl.constexpr, SHAPE_S: tl.constexpr,
+                      BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr):
     """
     Forward of batch norm kernel. Tiling along axis-(H, W, N).
     """
-    pid_n, pid_c, pid_hw = tl.program_id(axis=0), tl.program_id(axis=1), tl.program_id(axis=2)
+    pid_n, pid_s = tl.program_id(axis=0), tl.program_id(axis=1)
 
     # pointer arithmetic, and mask calculation
     ofst_n = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
-    ofst_c = pid_c*BLOCK_C + tl.arange(0, BLOCK_C)
-    ofst_hw = pid_hw*BLOCK_HW + tl.arange(0, BLOCK_HW)
+    ofst_c = tl.arange(0, BLOCK_C)
+    ofst_s = pid_s*BLOCK_S + tl.arange(0, BLOCK_S)
+    offsets = (stride_n*ofst_n)[:, None, None] +\
+              (stride_c*ofst_c)[None, :, None] +\
+              (stride_s*ofst_s)[None, None, :]
 
-    x_ofst = (stride_n*ofst_n)[:, None, None] + (stride_c*ofst_c)[None, :, None] + (stride_w*ofst_hw)[None, None, :]
+    for idx_c in range(tl.cdiv(SHAPE_C, BLOCK_C)):
+        mask_c = ofst_c < SHAPE_C
 
-    mask_n = ofst_n < N
-    mask_c = ofst_c < C
-    mask_hw = ofst_hw < H*W
-    x_mask = mask_n[:, None, None] * mask_c[None, :, None] * mask_hw[None, None, :]
+        # calculate mean of var of input x, for each channel
+        accum_x = tl.zeros((BLOCK_C,), dtype=tl.float32)
+        accum_xx = tl.zeros((BLOCK_C,), dtype=tl.float32)
+        for idx_n in range(tl.cdiv(SHAPE_N, BLOCK_N)):
+            mask_n = ofst_n < SHAPE_N
 
-    # do partial sum
-    x = tl.load(x_ptr + x_ofst, mask=x_mask, other=0.0)
-    x = tl.permute(x, (0, 2, 1)).reshape(BLOCK_N*BLOCK_HW, BLOCK_C)
-    sum_x = tl.sum(x, axis=0)
-    sum_xx = tl.sum(x*x, axis=0)
+            for idx_s in range(tl.cdiv(SHAPE_S, BLOCK_S)):
+                mask_s = ofst_s < SHAPE_S
 
-    # do full reduction
-    while tl.atomic_cas(lock_ptr, 0, 1) != 0:
-        pass
-    accum_x = tl.load(sum_x_ptr + ofst_c, mask=mask_c)
-    accum_xx = tl.load(sum_xx_ptr + ofst_c, mask=mask_c)
-    tl.store(sum_x_ptr + ofst_c, accum_x + sum_x, mask=mask_c)
-    tl.store(sum_xx_ptr + ofst_c, accum_xx + sum_xx, mask=mask_c)
-    n_completed = tl.load(n_completed_ptr)
-    tl.store(n_completed_ptr, n_completed + 1)
-    tl.atomic_xchg(lock_ptr, 0)
+                mask = mask_n[:, None, None] * mask_c[None, :, None] * mask_s[None, None, :]
+                x = tl.load(X + offsets, mask, other=0.0)
+                x = tl.permute(x, (1, 0, 2)).reshape(BLOCK_C, BLOCK_N*BLOCK_S)
+                accum_x += tl.sum(x, axis=1)
+                accum_xx += tl.sum(x*x, axis=1)
 
-    # synchronize
-    n_blocks = tl.cdiv(N, BLOCK_N)*tl.cdiv(C, BLOCK_C)*tl.cdiv(H*W, BLOCK_HW)
-    while tl.load(n_completed_ptr, volatile=True) < n_blocks:
-        pass
+                ofst_s += BLOCK_S
+                offsets += BLOCK_S*stride_s
 
-    # do element wise operation
-    weight = tl.load(weight_ptr + ofst_c, mask=mask_c, other=0.0)
-    bias = tl.load(bias_ptr + ofst_c, mask=mask_c, other=0.0)
-    sum_x = tl.load(sum_x_ptr + ofst_c, mask=mask_c, other=0.0)
-    sum_xx = tl.load(sum_xx_ptr + ofst_c, mask=mask_c, other=0.0)
-    mean_x = sum_x/(N*H*W)
-    var_x = sum_xx/(N*H*W) - mean_x*mean_x
-    inv_stdvar = 1.0/(tl.sqrt(var_x) + epsilon)
-    x = x.reshape(BLOCK_N, BLOCK_HW, BLOCK_C).permute(0, 2, 1)
-    normed_x = (x - mean_x[None, :, None])*inv_stdvar[None, :, None]
-    normed_x = normed_x*weight[None, :, None] + bias[None, :, None]
+            ofst_s = pid_s*BLOCK_S + tl.arange(0, BLOCK_S)
+            offsets -= BLOCK_S*tl.cdiv(SHAPE_S, BLOCK_S)*stride_s
+            ofst_n += BLOCK_N
+            offsets += BLOCK_N*stride_n
 
-    tl.store(y_ptr + x_ofst, normed_x, mask=x_mask)
+        mean_x = accum_x/(SHAPE_N*SHAPE_S)
+        mean_xx = accum_xx/(SHAPE_N*SHAPE_S)
+        stdvar = tl.sqrt(mean_xx - (mean_x*mean_x))
+        tl.store(X_mean + ofst_c, accum_x, mask_c)
+        tl.store(X_stdvar + ofst_c, stdvar, mask_c)
 
-@triton.jit
-def kernel_bn_backward_grad_weight(result_ptr, grad_y_ptr, normed_x_ptr, lock_ptr, n_completed_ptr,
-                                   N, C, H, W, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(axis=0)
-    indices = BLOCK_SIZE*pid + tl.arange(0, BLOCK_SIZE)
-    mask = indices < N*C*H*W
-    grad_y = tl.load(grad_y_ptr + indices, mask=mask, other=0.0)
-    normed_x = tl.load(normed_x_ptr + indices, mask=mask, other=0.0)
-    psum = tl.sum(grad_y*normed_x)
+        ofst_n = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
+        offsets -= BLOCK_N*tl.cdiv(SHAPE_N, BLOCK_N)*stride_n
 
-    while tl.atomic_cas(lock_ptr, 0, 1) != 0:
-        pass
-    accum = tl.load(result_ptr)
-    tl.store(result_ptr, psum + accum)
-    tl.atomic_xchg(lock_ptr, 0)
+        # normalized input x, for each channel
+        weight_ = tl.load(weight_ptr + ofst_c, mask_c, other=0.0)
+        bias_ = tl.load(bias_ptr + ofst_c, mask_c, other=0.0)
+        for idx_n in range(tl.cdiv(SHAPE_N, BLOCK_N)):
+            mask_n = ofst_n < SHAPE_N
 
-@triton.jit
-def kernel_bn_backward_grad_bias(result_ptr, grad_y_ptr, lock_ptr, n_completed_ptr,
-                                 N, C, H, W, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(axis=0)
-    indices = BLOCK_SIZE*pid + tl.arange(0, BLOCK_SIZE)
-    mask = indices < N*C*H*W
-    grad_y = tl.load(grad_y_ptr + indices, mask=mask, other=0.0)
-    psum = tl.sum(grad_y)
-    while tl.atomic_cas(lock_ptr, 0, 1) != 0:
-        pass
-    accum = tl.load(result_ptr)
-    tl.store(result_ptr, psum + accum)
-    tl.atomic_xchg(lock_ptr, 0)
+            for idx_s in range(tl.cdiv(SHAPE_S, BLOCK_S)):
+                mask_s = ofst_s < SHAPE_S
+
+                mask = mask_n[:, None, None] * mask_c[None, :, None] * mask_s[None, None, :]
+                x = tl.load(X + offsets, mask, other=0.0)
+                normed_x =  (x - mean_x[None, :, None])/(stdvar[None, :, None] + epsilon)
+                result = normed_x*weight_[None, :, None] + bias_[None, :, None]
+                tl.store(X_normed + offsets, normed_x, mask)
+                tl.store(Y + offsets, result, mask)
+
+                ofst_s += BLOCK_S
+                offsets += BLOCK_S*stride_s
+
+            ofst_s = pid_s*BLOCK_S + tl.arange(0, BLOCK_S)
+            offsets -= BLOCK_S*tl.cdiv(SHAPE_S, BLOCK_S)*stride_s
+            ofst_n += BLOCK_N
+            offsets += BLOCK_N*stride_n
+
+        ofst_n = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
+        offsets -= BLOCK_N*tl.cdiv(SHAPE_N, BLOCK_N)*stride_n
+
+        ofst_c += BLOCK_C
+        offsets += BLOCK_C*stride_c
 
 @triton.jit
-def _kernel_mean_method0(Y, X, SHAPE_N, SHAPE_C, SHAPE_HW, stride_n, stride_hw, stride_c,
-                         BLOCK_N: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_HW: tl.constexpr):
-    """
-    Desc
-    ====
-        calculate mean of the input tensor. shape relation of input and output (N, C, HW) -> (C,)
-        Kernel of method0 does not split channel dimmension. As consequence, not synchronization between blocks
-        is required.
-
-    Parameter
-    =========
-        Y : output tensor, shape=(SHAPE_C,)
-        X : input tensor, shape=(SHAPE_N, SHAPE_C, SHAPE_HW)
-        (SHAPE_N, SHAPE_C, SHAPE_HW): shape parameters
-        (stride_n, stride_c, stride_hw): stride of input tensoor
-        (BLOCK_N, BLOCK_C, BLOCK_HW): shape of a block
-    """
-    pid_n, pid_c, pid_hw = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+def _kernel_bn_grad_x(grad_x, normed_y, grad_y, grad_y_mean, prod_mean, gamma,
+                      stride_n, stride_c, stride_s,
+                      SHAPE_N: tl.constexpr, SHAPE_C: tl.constexpr, SHAPE_S: tl.constexpr,
+                      BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr):
+    pid_n, pid_s = tl.program_id(0), tl.program_id(1)
 
     ofst_n = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
-    ofst_c = pid_c*BLOCK_C + tl.arange(0, BLOCK_C)
-    ofst_hw = pid_hw*BLOCK_HW + tl.arange(0, BLOCK_HW)
-    mask_n = ofst_n < SHAPE_BATCH
-    mask_c = ofet_c < SHAPE_C
-    mask_hw = ofst_hw < SHAPE_HW
+    ofst_c = tl.arange(0, BLOCK_C)
+    ofst_s = pid_s*BLOCK_S + tl.arange(0, BLOCK_S)
+    offsets = (ofst_n*stride_n)[:, None, None] +\
+              (ofst_c*stride_c)[None, :, None] +\
+              (ofst_s*stride_s)[None, None, :]
+    epsilon = 1E-5
 
-    ofst_x = ofst_n*stride_n[:, None, None] + ofst_c*stride_c[None, :, None] + ofst_hw*stride_hw[None, None, :]
-    mask_x = mask_n[:, None, None] * mask_c[None, :, None] * mask_hw[None, None, :]
+    for idx_c in range(tl.cdiv(SHAPE_C, BLOCK_C)):
+        mask_c = ofst_c < SHAPE_C
 
-    x = tl.load(X + ofst_x, mask=mask_x, other=0.0)
-    x_permute = tl.permute(x, (1, 0, 2)).reshape(BLOCK_C, BLOCK_N*BLOCK_HW)
-    mean = tl.sum(x, axis=1)/(SHAPE_N*SHAPE_HW)
+        gamma_tile = tl.load(gamma + ofst_c, mask_c, other=0.0)
+        grad_y_mean_tile = tl.load(grad_y_mean + ofst_c, mask_c)
+        prod_mean_tile = tl.load(prod_mean + ofst_c, mask_c)
+        for idx_n in range(tl.cdiv(SHAPE_N, BLOCK_N)):
+            mask_n = ofst_n < SHAPE_N
 
-    ofst_y, mask_y = ofst_c, mask_c
-    tl.store(Y + ofst_y, mean, mask=mask_y)
+            for idx_s in range(tl.cdiv(SHAPE_S, BLOCK_S)):
+                mask_s = ofst_s < SHAPE_S
 
-@triton.jit
-def _kernel_mean_method1(Y: torch.Tensor, X: torch.Tensor, n_completed: torch.Tensor, mutex: torch.Tensor,
-                         SHAPE_N, SHAPE_C, SHAPE_HW, stride_n, stride_c, stride_hw,
-                         BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_HW: tl.constexpr):
-    """
-    Desc
-    ====
-        calculate mean of the input tensor. shape relation of input and output (N, C, HW) -> (C,)
-        Kernel of method1 split channel dimmension, which implies that synchronization between block
-        is required.
+                mask = mask_n[:, None, None] * mask_c[None, :, None] * mask_s[None, None, :]
+                grad_y_tile = tl.load(grad_y + offsets, mask)
+                normed_y_tile = tl.load(normed_y + offsets, mask)
 
-    Parameter
-    =========
-        Y : output tensor, shape=(SHAPE_C,)
-        X : input tensor, shape=(SHAPE_N, SHAPE_C, SHAPE_HW)
-        n_completed : auxilary flag of integer type, showing how many partial sums has been accumulated.
-                      shape=(SHAPE_C,)
-        mutex: a software mutex lock for synchronization between blocks. shape=(SHAPE_C,)
-        (SHAPE_N, SHAPE_C, SHAPE_HW): shape parameters
-        (BLOCK_N, BLOCK_C, BLOCK_HW): shape of a block
-    """
-    pid_n, pid_c, pid_hw = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    ofst_n = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
-    ofst_c = pid_c*BLOCK_C + tl.arange(0, BLOCK_C)
-    ofst_hw = pid_hw*BLOCK_HW + tl.arange(0, BLOCK_HW)
-    mask_n = ofst_n < SHAPE_BATCH
-    mask_c = ofst_c < SHAPE_C
-    mask_hw = ofst_hw < SHAPE_HW
+                grad_x_tile = grad_y_tile - grad_y_mean_tile[None, :, None]
+                grad_x_tile -= normed_y_tile*prod_mean_tile[None, :, None]
+                grad_x_tile = grad_x_tile/(gamma_tile + epsilon)[None, :, None]
 
-    ofst_x = ofst_n*stride_n[:, None, None] + ofst_c*stride_c[None, :, None] + ofst_hw*stride_hw[None, None, :]
-    mask_x = mask_n[:, None, None] * mask_c[None, :, None] * mask_hw[None, None, :]
+                tl.store(grad_x + offsets, grad_x_tile, mask)
+                ofst_s += BLOCK_S
+                offsets += BLOCK_S*stride_s
 
-    x = tl.load(X + ofst_x, mask=mask_x, other=0.0)
-    x_permute = tl.permute(x, (1, 0, 2)).reshape(BLOCK_C, BLOCK_N*BLOCK_HW)
-    p_sum = tl.sum(x_permute, axis=1)
+            ofst_s = pid_s*BLOCK_S + tl.arange(0, BLOCK_S)
+            offsets -= BLOCK_S*tl.cdiv(SHAPE_S, BLOCK_S)*stride_s
+            ofst_n += BLOCK_N
+            offsets += BLOCK_N*stride_n
 
-    # add partial sum to global accumulation
-    while tl.atomic_cas(mutex + pid_c, 0, 1) == 1:
-        continue
-
-    ofst_y, mask_y = ofst_c, mask_c
-    accum = tl.load(Y + ofst_y, mask=mask_y)
-    tl.store(Y + ofst_y, accum + p_sum, mask=mask_y)
-    tl.atomic_add(n_completed + pid_c, 1)
-
-
-    # software approach, to synchronize between block
-    while tl.load(n_completed + pid_c, volatile=True) < tl.cdiv(SHAPE_C, BLOCK_C):
-        continue
-
-    # now partial sum by each block has been accumualted, continue calculating mean result
-    # this is only required by block-0
-    if pid_c == 0:
-        accum = tl.load(Y + ofst_y, mask=mask)
-        mean_x = accum/(BLOCK_N*BLOCK_HW)
-        tl.store(Y + ofst_y, mask=mask_y)
+        ofst_n = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
+        offsets -= BLOCK_N*tl.cdiv(SHAPE_N, BLOCK_N)*stride_n
+        ofst_c += BLOCK_C
+        offsets += BLOCK_C*stride_c
 
 @triton.jit
-def _kernel_bn_elementwise_prod(C: torch.Tensor, A: torch.Tensor, B: torch.Tensor,
-                                SHAPE_N, SHAPE_C, SHAPE_HW, stride_n, stride_c, stride_hw,
-                                BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_HW: tl.constexpr):
-    """
-    Desc
-    ====
-        does element-wise production of two input tensors of the same shape. channel first layout is assumed
+def _kernel_bn_sum_reduce(Y, X, stride_n, stride_c, stride_s,
+                    mean: tl.constexpr,
+                    SHAPE_N: tl.constexpr, SHAPE_C: tl.constexpr, SHAPE_S: tl.constexpr,
+                    BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr):
+    pid_n, pid_s = tl.program_id(0), tl.program_id(1)
 
-    Kernel Parameters
-    =================
-        C: result tensor, shape=(BLOCK_N, BLOCK_C, BLOCK_HW)
-        A: 1st operand, shape=(BLOCK_N, BLOCK_C, BLOCK_HW)
-        B: 2nd operand, shape=(BLOCK_N, BLOCK_C, BLOCK_HW)
-        (SHAPE_N, SHAPE_C, SHAPE_HW): shape of the global tensor
-        (stride_n, stride_c, stride_hw): stride of the global tensor, assuming same physical layout of A, B and C
-        (BLOCK_N, BLOCK_C, BLOCK_HW): block shape of tiled tensor, processed by each kernel
-    """
-    pid_n, pid_c, pid_hw = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     ofst_n = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
-    ofst_c = pid_c*BLOCK_C + tl.arange(0, BLOCK_C)
-    ofst_hw = pid_hw*BLOCK_HW + tl.arange(0, BLOCK_HW)
-    mask_n = ofst_n < SHAPE_N
-    mask_c = ofst_c < SHAPE_C
-    mask_hw = ofst_hw < SHAPE_HW
+    ofst_c = tl.arange(0, BLOCK_C)
+    ofst_s = pid_s*BLOCK_S + tl.arange(0, BLOCK_S)
+    offsets = (ofst_n*stride_n)[:, None, None]
+    offsets += (ofst_c*stride_c)[None, :, None]
+    offsets += (ofst_s*stride_s)[None, None, :]
 
-    ofst = stride_n*ofst_n[:, None, None] +\
-           stride_c*ofst_c[None, :, None] +\
-           stride_hw*ofst_hw[None, None, :]
-    mask = mask_n[:, None, None] * mask_c[None, :, None] * mask_hw[None, None, :]
+    for idx_c in range(tl.cdiv(SHAPE_C, BLOCK_C)):
+        mask_c = ofst_c < SHAPE_C
 
-    a_tile = tl.load(A + ofst, mask=mask, other=0.0)
-    b_tile = tl.load(B + ofst, mask=mask)
-    tl.store(C + ofst, a_tile*b_tile, mask=mask)
+        accum = tl.zeros((BLOCK_C,), dtype=tl.float32)
+        for idx_n in range(tl.cdiv(SHAPE_N, BLOCK_N)):
+            mask_n = ofst_n < SHAPE_N
 
-@triton.jit
-def _kernel_bn_grad_input(grad_x, y, grad_y, grad_y_mean, prod_mean, gamma,
-                          SHAPE_N, SHAPE_C, SHAPE_HW, stride_n, stride_c, stride_hw,
-                          BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_HW: tl.constexpr):
-    """
-    Desc
-    ====
-        backward gradient w.r.t input, channel first layout is assumed.
-        grad_x = 1/delta (grad_y - mean(grad_y)[None, :, None] - y*(mean(y*grad_y)[None, :, None]))
+            for idx_s in range(tl.cdiv(SHAPE_S, BLOCK_S)):
+                mask_s = ofst_s < SHAPE_S
 
-    Kernel Parameters
-    =================
-        grad_x: output tensor, shape=(BLOCK_N, BLOCK_C, BLOCK_HW)
-        y, input tensor: normalzed x saved to context during forward pass
-        grad_y: input tensor, gradient of the BN operator result
-        grad_y_mean: mean of gradident y, calculated by backward kernel
-        prod_mean: mean(y*grad_y), calculated by backward kernel
-        (SHAPE_N, SHAPE_C, SHAPE_HW): shape of the global tensor
-        (stride_n, stride_c, stride_hw): stride of the global tensor, assuming same physical layout of A, B and C
-        (BLOCK_N, BLOCK_C, BLOCK_HW): block shape of tiled tensor, processed by each kernel
-    """
-    pid_n, pid_c, pid_hw = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    ofst_n = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
-    ofst_c = pid_c*BLOCK_C + tl.arange(0, BLOCK_C)
-    ofst_hw = pid_hw*BLOCK_HW + tl.arange(0, BLOCK_HW)
-    mask_n = ofst_n < SHAPE_BATCH
-    mask_c = ofet_c < SHAPE_C
-    mask_hw = ofst_hw < SHAPE_HW
+                mask = mask_n[:, None, None] * mask_c[None, :, None] * mask_s[None, None, :]
+                x = tl.load(X + offsets, mask, other=0.0)
+                x = tl.permute(x, 1, 0, 2).reshape(BLOCK_C, BLOCK_N*BLOCK_S)
+                accum += tl.sum(x, axis=1)
 
-    ofst = ofst_n*stride_n[:, None, None] + ofst_c*stride_c[None, :, None] + ofst_hw*stride_hw[None, None, :]
-    mask = mask_n[:, None, None] * mask_c[None, :, None] * mask_hw[None, None, :]
+                ofst_s += BLOCK_S
+                offsets += BLOCK_S*stride_s
 
-    _y = tl.load(y + ofst, mask=mask)
-    _grad_y = tl.load(grad_y + ofst, mask=mask)
-    _grad_y_mean = tl.load(C + ofst_c, mask=mask_c)
+            ofst_s = pid_s*BLOCK_S + tl.arange(0, BLOCK_S)
+            offsets -= BLOCK_S*tl.cdiv(SHAPE_S, BLOCK_S)*stride_s
+            ofst_n += BLOCK_N
+            offsets += BLOCK_N*stride_n
 
-    _grad_x = _grad_y - _grad_y_mean[None, :, None] - _y*prod_mean[None, :, None]
-    tl.store(grad_x + ofst, _grad_x/gammra[None, :, None], mask=mask)
+        if mean:
+            result = accum/(SHAPE_N*SHAPE_S)
+            tl.store(Y + ofst_c, result, mask=mask_c)
+        else:
+            tl.store(Y + ofst_c, accum, mask=mask_c)
+
+        ofst_n = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
+        offsets -= BLOCK_N*tl.cdiv(SHAPE_N, BLOCK_N)*stride_n
+        ofst_c += BLOCK_C
+        offsets += BLOCK_C*stride_c
 
 # --------------------------------------------------------------------------------------------------------------------
 #   Operator class
@@ -277,31 +201,129 @@ def _kernel_bn_grad_input(grad_x, y, grad_y, grad_y_mean, prod_mean, gamma,
 class BatchNorm(torch.autograd.Function):
     @staticmethod
     def forward(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, epsilon=1e-05):
-        logging.debug("BN forward")
         assert (len(weight.shape) == len(bias.shape)) and (len(weight.shape) == 1)
         assert (len(x.shape) == 4) and (x.shape[1] == bias.shape[0]) and (weight.shape[0] == bias.shape[0])
         N, C, H, W = x.shape
+        tiler = TileAssist()
+        tile_shape = tiler.calc_tiling((N, C, H, W))
 
-        y = torch.empty(N, C, H, W, dtype=torch.float32, device='cuda')
-        sum_x = torch.zeros(C, dtype=torch.float32, device='cuda')
-        sum_xx = torch.zeros(C, dtype=torch.float32, device='cuda')
-        lock = torch.zeros(1, dtype=torch.int32, device='cuda')
-        n_completed = torch.zeros(1, dtype=torch.int32, device='cuda')
+        _cdiv = lambda a, b: (a + b -1)//b
+        grid = lambda meta: (_cdiv(meta["BLOCK_N"], tile_shape[0]),
+                         _cdiv(meta["BLOCK_S"], tile_shape[2]))
 
-        # Static tiling. TODO: update to flexble tiling according to input shape
-        BLOCK_N, BLOCK_C, BLOCK_HW = 4, 8, 128
-        cdiv = lambda a, b: (a + b - 1) // b
-        grid = lambda meta: (cdiv(N, meta["BLOCK_N"]), cdiv(C, meta["BLOCK_C"]), cdiv(H*W, meta["BLOCK_HW"]))
-        kernel_bn_forward[grid](y, x, weight, bias, epsilon, lock, sum_x, sum_xx, n_completed, *x.stride(),
-                                N, C, H, W, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C, BLOCK_HW=BLOCK_HW)
+        x = torch.reshape(x, shape=[N, C, -1])
+        x_normed = torch.empty(N, C, H*W, dtype=torch.float32, device="cuda")
+        x_mean = torch.empty(C, dtype=torch.float32, device="cuda")
+        x_stdvar = torch.empty(C, dtype=torch.float32, device="cuda")
+        y = torch.empty(N, C, H*W, dtype=torch.float32, device="cuda")
+        kernel_bn_forward[grid](y, x_mean, x_stdvar, x_normed, x, weight, bias, *x.stride(), epsilon=epsilon,
+                            SHAPE_N=N, SHAPE_C=C, SHAPE_S=H*W,
+                            BLOCK_N=tile_shape[0], BLOCK_C=tile_shape[1], BLOCK_S=tile_shape[2])
 
-        #TODO.boyue, save normed_y, instead of y
-        ctx.save_for_backward(y, weight, bias)
+        y = torch.reshape(y, shape=[N, C, H, -1])
+        x_normed = torch.reshape(x_normed, [N, C, H, -1])
+        x = torch.reshape(x, shape=[N, C, H, -1])
+
+        ctx.save_for_backward(x_normed, weight, bias)
         return y
 
     @staticmethod
+    def op_bn_grad_wrt_bias(grad_y: torch.Tensor):
+        from tile_calc import TileAssist
+        shape = grad_y.shape
+        assert (len(shape) == 4)
+        N, C, H, W = shape
+
+        # calculation of launch grid, which will be reused by all kernels
+        tiler = TileAssist()
+        tile_shape = tiler.calc_tiling((N, C, H, W))
+        grad_y = torch.reshape(grad_y, shape=[N, C, -1])
+
+        _cdiv = lambda a, b: (a + b -1)//b
+        grid = lambda meta: (_cdiv(meta["BLOCK_N"], tile_shape[0]),
+                             _cdiv(meta["BLOCK_S"], tile_shape[2]))
+
+        result = torch.empty(C, dtype=torch.float32, device="cuda")
+        _kernel_bn_sum_reduce[grid](result, grad_y, *grad_y.stride(), mean=False,
+                                    SHAPE_N=N, SHAPE_C=C, SHAPE_S=H*W,
+                                    BLOCK_N=tile_shape[0], BLOCK_C=tile_shape[1], BLOCK_S=tile_shape[2])
+
+        grad_y = torch.reshape(grad_y, shape=[N, C, H, W])
+        return result
+
+    @staticmethod
+    def op_bn_grad_wrt_input(grad_y: torch.Tensor, normed_y: torch.Tensor, gamma: torch.Tensor, epsilon=1E-5):
+        from tile_calc import TileAssist
+        shape_grad_y = grad_y.shape
+        shape_y = normed_y.shape
+        assert (shape_grad_y == shape_y) and (len(shape_y) == 4)
+        N, C, H, W = shape_y
+
+        # calculation of launch grid, which will be reused by all kernels
+        tiler = TileAssist()
+        tile_shape = tiler.calc_tiling((N, C, H, W))
+
+        _cdiv = lambda a, b: (a + b -1)//b
+        grid = lambda meta: (_cdiv(meta["BLOCK_N"], tile_shape[0]),
+                             _cdiv(meta["BLOCK_S"], tile_shape[2]))
+
+        # fuse spatial H, W to S
+        grad_y = torch.reshape(grad_y, shape=[N, C, -1])
+        normed_y = torch.reshape(normed_y, shape=[N, C, -1])
+
+        # mean of gradient wrt to y
+        grad_y_mean = torch.empty(C, device="cuda")
+        _kernel_bn_sum_reduce[grid](grad_y_mean, grad_y, *grad_y.stride(),
+            mean=True, SHAPE_N=N, SHAPE_C=C, SHAPE_S=H*W,
+            BLOCK_N=tile_shape[0], BLOCK_C=tile_shape[1], BLOCK_S=tile_shape[2])
+
+        #mean of normded_y*grad_y
+        prod_mean = torch.empty(C, device="cuda")
+        _kernel_bn_fused_prodmean[grid](prod_mean, grad_y, normed_y, *grad_y.stride(),
+            mean=True,
+            SHAPE_N=N, SHAPE_C=C, SHAPE_S=H*W,
+            BLOCK_N=tile_shape[0], BLOCK_C=tile_shape[1], BLOCK_S=tile_shape[2])
+
+        # final result
+        grad_x = torch.empty(N, C, H*W, device="cuda")
+        _kernel_bn_grad_x[grid](grad_x, normed_y, grad_y, grad_y_mean, prod_mean, gamma, *grad_y.stride(),
+            SHAPE_N=N, SHAPE_C=C, SHAPE_S=H*W,
+            BLOCK_N=tile_shape[0], BLOCK_C=tile_shape[1], BLOCK_S=tile_shape[2])
+
+        # restore spatial axis to H, W
+        grad_y = torch.reshape(grad_y, shape=[N, C, H, W])
+        normed_y = torch.reshape(normed_y, shape=[N, C, H, W])
+        grad_x = torch.reshape(grad_x, shape=[N, C, H, W])
+
+        return grad_y_mean, prod_mean, grad_x
+
+    @staticmethod
+    def op_bn_grad_wrt_weight(grad_y: torch.Tensor, normed_x: torch.Tensor):
+        assert (grad_y.shape == normed_x.shape)
+
+        N, C, H, W = grad_y.shape
+        tiler = TileAssist()
+        tile_shape = tiler.calc_tiling((N, C, H, W))
+
+        _cdiv = lambda a, b: (a + b -1)//b
+        grid = lambda meta: (_cdiv(meta["BLOCK_N"], tile_shape[0]),
+                             _cdiv(meta["BLOCK_S"], tile_shape[2]))
+
+        grad_y = torch.reshape(grad_y, shape=[N, C, -1])
+        normed_x = torch.reshape(normed_x, shape=[N, C, -1])
+
+        result = torch.empty(C, dtype=torch.float32, device="cuda")
+        _kernel_bn_fused_prodmean[grid](result, grad_y, normed_x, *grad_y.stride(),
+                   mean=False,
+                   SHAPE_N=N, SHAPE_C=C, SHAPE_S=H*W,
+                   BLOCK_N=tile_shape[0], BLOCK_C=tile_shape[1], BLOCK_S=tile_shape[2])
+
+        grad_y = torch.reshape(grad_y, shape=[N, C, H, -1])
+        normed_x = torch.reshape(normed_x, shape=[N, C, H, -1])
+        return result
+
+    @staticmethod
     def backward(ctx, out_grad, mean_grad, rstd_grad):
-        pass
         return in_grad, None, weight_grad, bias_grad, None, None
 
     class TileAssist():
@@ -309,7 +331,8 @@ class BatchNorm(torch.autograd.Function):
             self.smem_size = smem_size
             self.datum_size = datum_size
             self.BATCH_IDX, self.CHANNEL_IDX, self.SPATIAL_IDX = range(0, 3)
-            self.trial_prio = [self.CHANNEL_IDX, self.SPATIAL_IDX, self.BATCH_IDX]
+            self.trial_prio = [self.CHANNEL_IDX, self.BATCH_IDX, self.SPATIAL_IDX]
+            self.dim_minima = [2, 1, 32]
             self.merged_shape = None
 
         def calc_tiling(self, shape):
@@ -317,9 +340,12 @@ class BatchNorm(torch.autograd.Function):
                (BATCH, CHANNEL, H, W)
             """
             assert(len(shape) == 4)
+            next_power2 = lambda x: 2**math.ceil(math.log2(x))
             self.merged_shape = shape[0], shape[1], shape[2]*shape[3]
-            SHAPE_HW_MIN = 8
-            tile_shape = [1, 1, SHAPE_HW_MIN]
+            tile_shape = list(map(next_power2, self.merged_shape))
+            logging.debug(f"Orig shape: {shape}")
+            logging.debug(f"Merged shape: {self.merged_shape}")
+            logging.debug(f"Tile shape (init): {tile_shape}")
 
             for dim_idx in self.trial_prio:
                solution = self.trial_split(dim_idx, tile_shape)
@@ -328,21 +354,28 @@ class BatchNorm(torch.autograd.Function):
                    return solution
 
             self.merged_shape = None
+            logging.debug(f"Tile shape (finial): {tile_shape}")
             return tile_shape
 
         def trial_split(self, dim_idx, tile_shape):
             assert(dim_idx < len(tile_shape))
             assert(self.merged_shape and (dim_idx < len(self.merged_shape)))
-            next_power2 = lambda x: 2**math.ceil(math.log2(x))
-            tile_shape[dim_idx] = next_power2(self.merged_shape[dim_idx])
+            tile_shape[dim_idx] = self.dim_minima[dim_idx]
 
             product = lambda a, b: a*b
             tile_size = lambda shape: reduce(product, shape)*self.datum_size
-            if tile_size(tile_shape) <= self.smem_size:
+            if tile_size(tile_shape) > self.smem_size:
                 return None
 
-            while tile_size(tile_shape) > self.smem_size:
-                tile_shape[dim_idx] = (tile_shape[dim_idx] // 2)
+            while True:
+                if tile_size(tile_shape) > self.smem_size:
+                    break
+                if tile_shape[dim_idx] >= self.merged_shape[dim_idx]:
+                    break
+                tile_shape[dim_idx] = tile_shape[dim_idx] * 2
+
+            if tile_size(tile_shape) > self.smem_size:
+                tile_shape[dim_idx] = tile_shape[dim_idx] // 2
 
             return tile_shape
 
