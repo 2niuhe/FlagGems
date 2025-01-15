@@ -25,6 +25,7 @@ from .conv_depthwise2d import _conv_depthwise2d
 from .cos import cos
 from .count_nonzero import count_nonzero
 from .cross_entropy_loss import cross_entropy_loss
+from .cummaxmin_backward import cummaxmin_backward
 from .cummin import cummin
 from .cumsum import cumsum, normed_cumsum
 from .diag import diag
@@ -154,6 +155,7 @@ __all__ = [
     "clamp_tensor",
     "cos",
     "count_nonzero",
+    "cummaxmin_backward",
     "diag",
     "diag_embed",
     "diagonal_backward",
