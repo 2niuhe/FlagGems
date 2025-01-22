@@ -214,14 +214,25 @@ def batch_norm_heur_block_n(args):
     return min(BLOCK_N, max(1, 2**14 // BLOCK_M))
 
 
-def vdot_heur_block_size(args):
+def vdot_heur_tile_size(args):
     n = args["n_elements"]
     if n < 1024:
         return 32
     elif n < 8192:
         return 256
-    else:
-        return 1024
+    return 1024
+
+
+def vdot_heur_tiles_per_block(args):
+    n = args["n_elements"]
+    # avoid serve atomic_add contentions
+    MAX_BLOCKS = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+    TILE_SIZE = vdot_heur_tile_size(args)
+
+    return max(1, n // (MAX_BLOCKS * TILE_SIZE))
 
 
 HEURISTICS_CONFIGS = {
@@ -300,6 +311,7 @@ HEURISTICS_CONFIGS = {
         "BLOCK_N": batch_norm_heur_block_n,
     },
     "vdot": {
-        "BLOCK_SIZE": vdot_heur_block_size,
+        "TILE_SIZE": vdot_heur_tile_size,
+        "TILE_NUM": vdot_heur_tiles_per_block,
     },
 }
